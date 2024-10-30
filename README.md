@@ -4,11 +4,7 @@ This project contains all the code, data, and output for the Firehouse Project. 
 Here is a description of the file structure and files.
 The final Report.html file also added to the main directory. 
 
-data/
-
-|—————raw/
-
-      |—————Call stats.xlsx
+data/ # **Please note that the data is not public and will not be included in the GitHub repo.**
 
 docs/
 
