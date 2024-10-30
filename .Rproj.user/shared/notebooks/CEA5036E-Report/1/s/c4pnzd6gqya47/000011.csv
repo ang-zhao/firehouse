@@ -1,0 +1,2 @@
+"0","#| code-fold: false"
+"0","model = gam(count ~ s(hour_unique), data = train_data, family = poisson)"

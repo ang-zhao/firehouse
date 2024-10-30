@@ -1,0 +1,492 @@
+---
+title: "Predicting Fire Suppression Calls"
+format:
+  html:
+    self-contained: true
+    page-layout: full
+    toc: true
+    toc-title: Contents
+    toc-location: left
+    #code-fold: true
+    code-overflow: wrap
+    code-tools: true
+    theme: minty
+    cap-location: bottom
+    tbl-cap-location: top
+editor: visual
+author: "Angela Zhao"
+date: "`r Sys.Date()`"
+execute:
+  error: false
+  warning: false
+  message: false
+  results: asis
+  freeze: auto
+  echo: false
+---
+
+# Introduction
+
+Accurately predicting fire suppression calls can significantly enhance emergency response planning and resource allocation. This analysis aims to develop a predictive model to forecast the timing of fire suppression calls using historical data. We will employ techniques such as Bootstrap, Principal Component Analysis (PCA), and Neural Networks with backpropagation to achieve this goal.
+
+# Data Preparation
+
+The data comes from the Baltimore County firehouse and includes data starting from 2015. Importantly, we extract the hour of the call from the time column of the Excel. 
+
+```{r}
+
+# Load libraries
+library(tidyverse)
+library(lubridate)
+library(rsample)
+library(hms)
+library(timeDate)
+library(ggplot2)
+library(openxlsx)
+library(here)
+library(viridis)
+library(ggpubr)
+library(mgcv)
+```
+
+```{r}
+# Load data
+data <- read.xlsx(here("data", "raw", "Call stats.xlsx"), 
+                  sheet = "Supression Only") %>% 
+  mutate(time = time * 86400, 
+         dispatched = as.Date(dispatched, origin = "1899-12-30")) 
+
+# Reformat call time and dispatch date to datetime object
+data <- data %>%
+  mutate(time_formatted = hms::as_hms(time))
+
+data <- data %>%
+  mutate(datetime = as.POSIXct(paste(dispatched, time_formatted), format = "%Y-%m-%d %H:%M:%S"))
+
+data$block = as.factor(data$block) %>% ordered(levels =c("12 AM - 2 AM", 
+                                                         "2 AM - 4 AM", 
+                                                         "4 AM - 6 AM", 
+                                                         "6 AM - 8 AM",
+                                                         "8 AM - 10 AM",
+                                                         "10 AM - 12 PM",
+                                                         "12 PM - 2 PM",
+                                                          "2 PM - 4 PM", 
+                                                         "4 PM - 6 PM", 
+                                                         "6 PM - 8 PM",
+                                                         "8 PM - 10 PM",
+                                                         "10 PM - 12 AM"))
+
+# Extract additional time-based features
+data <- data %>%
+  mutate(hour = hour(datetime),
+         day = day(datetime),
+         month = month(datetime),
+         year = year(datetime))
+```
+
+## Data Exploration
+
+Please take a look at the different tabs of the exploratory analysis. In this brief exploratory analysis, we see that the "Call Count by Day and Month" tab shows that there are not large distinctions across months of the year or across days of the week. Likewise, there are not large distinctions in the number of calls between holidays v.s. non-holidays and weekends v.s. weekdays. The heatmap suggests that the temporal patterns of the number of calls is relatively similar across all days of the week.
+
+Next, we explore whether holidays impact the number of calls. The "Holiday v.s. Non-Holiday" tab shows the counts on holidays and non-holidays, as well as the average number of calls per day on each. It does not seem like holidays have a large impact.
+
+Third, we explore the temporal patterns while grouping by days of the week, by month, and by year. The "Call Count by Time of Day" shows these plots. We see that the temporal patterns are relatively consistent across all days of week, across each month, and across years. The year 2024 is an outlier because we only have a data up until August. However, this will not influence our statistical analysis.
+
+```{r}
+#| output: false
+
+# Plot calls by day of week
+p_day = data %>%
+  count(Day.of.week) %>%
+  ggplot(aes(x = reorder(Day.of.week, n), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Calls by Day of Week", 
+       x = "Day of Week", y = "Number of Calls") +
+  coord_flip() + theme_minimal()
+
+ggsave(p_day, filename = here("docs", "figures", "hist_dayofweek.png"))
+
+# Plot calls by month
+p_month = data %>%
+  count(month) %>%
+  ggplot(aes(x = reorder(factor(month, labels = c("January", "February", "March",
+                                          "April", "May", "June", "July", "August",
+                                          "September", "October", "November", 
+                                          "December")),n), y = n)) +
+  geom_bar(stat = "identity", fill = "lightblue") +
+  labs(title = "Number of Calls by Month", 
+       x = "Month", y = "Number of Calls") +
+  coord_flip() + theme_minimal()
+ggsave(p_month, filename = here("docs", "figures", "hist_month.png"))
+
+# Create heat map of day of week v.s. hour
+# Aggregate calls by day_of_week and block
+aggregated_data <- data %>%
+  group_by(Day.of.week, block) %>%
+  summarise(call_count = n()) %>%
+  ungroup()
+
+# Ensure the day_of_week is ordered from Monday to Sunday
+aggregated_data$day_of_week <- factor(aggregated_data$Day.of.week, 
+                                     levels = c("Monday", "Tuesday", "Wednesday", "Thursday", 
+                                                "Friday", "Saturday", "Sunday"))
+
+# Create the heatmap
+p_heatmap <- ggplot(aggregated_data, aes(x = block, y = day_of_week, fill = call_count)) +
+  geom_tile(color = "white", width = 0.9, height = 0.9) +  # Adjust width here
+  scale_fill_viridis(name = "Number of Calls", option = "G") +
+  labs(
+    title = "Heatmap of Fire Suppression Calls by Time of Day and Day of Week",
+    x = "Time Block",
+    y = "Day of Week"
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  coord_fixed(ratio = 0.5)
+
+ggsave(p_heatmap, filename = here("docs", "figures", "heatmap.png"))
+
+# Plot calls by hour
+p_hour = data %>%
+  count(hour) %>%
+  ggplot(aes(x = hour, y = n)) +
+  geom_line() +
+  labs(title = "Number of Calls by Hour", 
+       x = "Hour of Day", y = "Number of Calls") +
+  scale_x_continuous(
+    breaks = 0:23, 
+    labels = c("12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", 
+               "5:00 AM", "6:00 AM", "7:00 AM", "8:00 AM", "9:00 AM", 
+               "10:00 AM", "11:00 AM", "12:00 PM", "1:00 PM", "2:00 PM", 
+               "3:00 PM", "4:00 PM", "5:00 PM", "6:00 PM", "7:00 PM", 
+               "8:00 PM", "9:00 PM", "10:00 PM", "11:00 PM"),
+    expand = c(0, 0)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "gray30"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+ggsave(p_hour, filename = here("docs", "figures", "counts_by_hr.png"))
+
+# Plot calls by hour and day of week
+p_hourbyday = data %>% group_by(Day.of.week) %>% count(hour) %>%
+  ggplot(aes(x = hour, y = n, color = Day.of.week)) +
+  geom_line() +
+  labs(title = "Number of Calls by Hour Grouped by Day of Week", 
+       x = "Hour of Day", y = "Number of Calls", color = "Day of Week") +
+  scale_x_continuous(
+    breaks = 0:23, 
+    labels = c("12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", 
+               "5:00 AM", "6:00 AM", "7:00 AM", "8:00 AM", "9:00 AM", 
+               "10:00 AM", "11:00 AM", "12:00 PM", "1:00 PM", "2:00 PM", 
+               "3:00 PM", "4:00 PM", "5:00 PM", "6:00 PM", "7:00 PM", 
+               "8:00 PM", "9:00 PM", "10:00 PM", "11:00 PM"),
+    expand = c(0, 0)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "gray30"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+ggsave(p_hourbyday, filename = here("docs", "figures", "counts_by_hrday.png"))
+
+# Plot calls by hour and month 
+p_hourbymonth = data %>% mutate(month = factor(month, labels = c("January", "February", "March",
+                                          "April", "May", "June", "July", "August",
+                                          "September", "October", "November", 
+                                          "December"))) %>%
+  group_by(month) %>% count(hour) %>%
+  ggplot(aes(x = hour, y = n, color = month)) +
+  geom_line() +
+  labs(title = "Number of Calls by Hour Grouped by Month", 
+       x = "Hour of Day", y = "Number of Calls", color = "Month") +
+  scale_x_continuous(
+    breaks = 0:23, 
+    labels = c("12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", 
+               "5:00 AM", "6:00 AM", "7:00 AM", "8:00 AM", "9:00 AM", 
+               "10:00 AM", "11:00 AM", "12:00 PM", "1:00 PM", "2:00 PM", 
+               "3:00 PM", "4:00 PM", "5:00 PM", "6:00 PM", "7:00 PM", 
+               "8:00 PM", "9:00 PM", "10:00 PM", "11:00 PM"),
+    expand = c(0, 0)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "gray30"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+ggsave(p_hourbymonth, filename = here("docs", "figures", "counts_by_hrmonth.png"))
+
+# Plot calls by hour and year
+p_hourbyyear = data %>%
+  group_by(year) %>% count(hour) %>%
+  ggplot(aes(x = hour, y = n, color = factor(year))) +
+  geom_line() +
+  labs(title = "Number of Calls by Hour Grouped by Year", 
+       x = "Hour of Day", y = "Number of Calls", color = "Year") +
+  scale_x_continuous(
+    breaks = 0:23, 
+    labels = c("12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", 
+               "5:00 AM", "6:00 AM", "7:00 AM", "8:00 AM", "9:00 AM", 
+               "10:00 AM", "11:00 AM", "12:00 PM", "1:00 PM", "2:00 PM", 
+               "3:00 PM", "4:00 PM", "5:00 PM", "6:00 PM", "7:00 PM", 
+               "8:00 PM", "9:00 PM", "10:00 PM", "11:00 PM"),
+    expand = c(0, 0)
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "gray30"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+ggsave(p_hourbyyear, filename = here("docs", "figures", "counts_by_hryear.png"))
+
+# Next, we explore whether holidays have an impact on the number of calls
+# List of US holidays
+us_holidays <- as.Date(holidayNYSE(unique(year(data$dispatched))))
+
+# Add holiday indicator
+data <- data %>%
+  mutate(is_holiday = if_else(dispatched %in% us_holidays, 1, 0))
+
+# Total number of days in the dataset
+total_days <- data %>%
+  summarise(days = n_distinct(dispatched)) %>%
+  pull(days)
+
+# Number of holiday days
+num_holiday_days <- data %>%
+  filter(is_holiday == 1) %>%
+  summarise(days = n_distinct(dispatched)) %>%
+  pull(days)
+
+# Number of non-holiday days
+num_non_holiday_days <- total_days - num_holiday_days
+
+cat("Total Days:", total_days, "\n")
+cat("Holiday Days:", num_holiday_days, "\n")
+cat("Non-Holiday Days:", num_non_holiday_days, "\n")
+
+# Total calls on holidays
+total_calls_holiday <- data %>%
+  filter(is_holiday == 1) %>%
+  summarise(total_calls = n()) %>%
+  pull(total_calls)
+
+# Total calls on non-holidays
+total_calls_non_holiday <- data %>%
+  filter(is_holiday == 0) %>%
+  summarise(total_calls = n()) %>%
+  pull(total_calls)
+
+# Average calls per holiday
+avg_calls_per_holiday <- total_calls_holiday / num_holiday_days
+
+# Average calls per non-holiday
+avg_calls_per_non_holiday <- total_calls_non_holiday / num_non_holiday_days
+
+cat("Average Calls per Holiday:", avg_calls_per_holiday, "\n")
+cat("Average Calls per Non-Holiday:", avg_calls_per_non_holiday, "\n")
+
+# Create a data frame for plotting
+holiday_avg_calls <- tibble(
+  Day_Type = c("Holiday", "Non-Holiday"),
+  Average_Calls = c(avg_calls_per_holiday, avg_calls_per_non_holiday)
+)
+
+# Plot calls by holiday indicator
+p_holiday = data %>%
+  count(is_holiday) %>%
+  ggplot(aes(x = factor(is_holiday, labels = c("Non-Holiday", "Holiday")), y = n)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Number of Calls Per Day on Holidays vs Non-Holidays", x = "Day Type", y = "Number of Calls") + theme_minimal()
+
+ggsave(p_holiday, filename = here("docs", "figures", "counts_by_holiday.png"))
+
+# Plot calls per day on holidays vs non-holidays
+p_avgholiday = holiday_avg_calls %>%
+  ggplot(aes(x = Day_Type, y = Average_Calls, fill = Day_Type)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Average Calls per Day: Holidays vs Non-Holidays", x = "Day Type", y = "Average Calls per Day") +
+  theme_minimal()
+ggsave(p_avgholiday, filename = here("docs", "figures", "avgcounts_by_holiday.png"))
+```
+
+::: panel-tabset
+### Call Count by Day and Month
+```{r exploratory_1}
+#| label: exploratory_1
+#| eval: true
+#| layout-ncol: 2
+#| echo: false
+p_day
+p_month
+```
+
+```{r exploratory_2}
+#| label: exploratory_2
+#| eval: true
+#| echo: false
+p_heatmap
+```
+
+### Holidays v.s. Non-Holidays
+```{r exploratory_3}
+#| label: exploratory_3
+#| eval: true
+#| layout-ncol: 2
+#| echo: false
+p_holiday
+p_avgholiday
+```
+
+### Call Count by Time of Day
+```{r exploratory_4}
+#| label: exploratory_4
+#| eval: true
+#| layout-ncol: 2
+#| echo: false
+p_hour
+p_hourbyday
+p_hourbymonth
+p_hourbyyear
+```
+:::
+
+# Statistical Modeling
+
+To predict and understand the number of fire suppression calls received throughout the day, we fit a generalized additive model. Unlike traditional models that assume a straight-line (linear) relationship between variables, GAMs allow for more flexible and curved relationships. This is particularly useful when the effect of time on call volumes isn't a simple straight line but may vary in a more complex manner throughout the day.
+
+### Model specification 
+
+The outcome of our model is the number of hourly calls. The predictor is a smoothed function of the time of day, binned by the hour. Call counts are whole numbers (i.e. you can't have 2.5 calls). The Poisson distribution is ideal for modeling such count-based data, especially when the counts are relatively low and events occur independently.
+
+### Running the GAM model
+
+To prepare our data for regression, we must first clean and reshape the data. The cleaned data was also padded with zeros to indicate hours with no calls.
+```{r Data Cleaning for GAM Model}
+# Create dataframe for regression model
+day_unique = unique(data$dispatched)
+hour_unique = unique(data$hour)
+clean.df = expand_grid(day_unique, hour_unique)
+clean.df = clean.df %>% 
+  left_join(
+    data %>% group_by(dispatched, hour) %>% summarize(call = n()),
+    by = c("day_unique" = "dispatched", "hour_unique" = "hour")
+  ) 
+clean.df = clean.df %>% mutate(count = case_when(is.na(call) ~ 0,
+                                      .default = call), year = year(day_unique))
+```
+
+Before fitting the model, we split our data into training and testing sets. The seed is set for reproducibility.
+```{r Split Data}
+#| code-fold: false
+set.seed(123)
+split <- initial_split(clean.df, prop = 0.8)
+train_data <- training(split)
+test_data <- testing(split)
+```
+
+Then, we fit the data on the training set.
+```{r}
+#| code-fold: false
+model = gam(count ~ s(hour_unique), data = train_data, family = poisson)
+```
+
+Finally, we can use the model to predict the expected number of calls at any hour of day using "new" data, which is our testing set.
+```{r}
+#| echo: true
+#| code-fold: false
+predict = predict.gam(model, test_data, type = "response", se.fit = TRUE)
+```
+
+# Results
+
+A plot of the expected number of calls is below, along with 95% confidence bands. 
+```{r}
+fitted_values = predict$fit
+se_values = predict$se.fit
+
+lower_bound = fitted_values - 1.96 * se_values
+upper_bound = fitted_values + 1.96 * se_values
+
+result = data.frame(
+  day_unique = test_data$day_unique,
+  block_unique = test_data$hour_unique,
+  fitted_values = fitted_values,
+  lower_bound = lower_bound,
+  upper_bound = upper_bound,
+  count = test_data$count
+)
+
+p_predict <- ggplot(data = result, aes(x = block_unique, y = fitted_values)) +
+  geom_ribbon(aes(ymin = lower_bound, ymax = upper_bound), 
+              fill = "steelblue", 
+              alpha = 0.3) +
+  geom_line(color = "steelblue", size = 1) + 
+  labs(
+    title = "Expected Number of Calls by Time of Day",
+    subtitle = "Confidence Intervals Representing 95% Prediction Bounds",
+    x = "Time of Day",
+    y = "Expected Number of Calls"
+  ) +
+  scale_x_continuous(
+    breaks = 0:23, 
+    labels = c("12:00 AM", "1:00 AM", "2:00 AM", "3:00 AM", "4:00 AM", 
+               "5:00 AM", "6:00 AM", "7:00 AM", "8:00 AM", "9:00 AM", 
+               "10:00 AM", "11:00 AM", "12:00 PM", "1:00 PM", "2:00 PM", 
+               "3:00 PM", "4:00 PM", "5:00 PM", "6:00 PM", "7:00 PM", 
+               "8:00 PM", "9:00 PM", "10:00 PM", "11:00 PM"),
+    expand = c(0, 0)
+  ) + 
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, size = 10, color = "gray30"),
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5, color = "steelblue"),
+    plot.subtitle = element_text(size = 12, hjust = 0.5, color = "gray50"),
+    axis.title = element_text(face = "bold", size = 12, color = "gray20"),
+    plot.caption = element_text(size = 10, hjust = 0, color = "gray50"),
+    panel.grid.major = element_line(color = "gray90"),
+    panel.grid.minor = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+ggsave(p_predict, filename = here("docs", "figures", "prediction_results.png"))
+```
+
+```{r gam_result}
+#| label: gam_result
+#| fig-cap: ""
+#| eval: true
+#| layout-ncol: 1
+#| echo: false
+p_predict
+```
+
+Interpretation:
+
+- *Early Morning (12:00 AM - 6:00 AM)*: The expected number of calls is at its lowest during the early morning hours, particularly around 3:00 AM to 5:00 AM. This is likely because most people are inactive, and fewer incidents require fire suppression services during these hours. 
+
+- *Morning Increase (6:00 AM - 12:00 PM):* Starting from around 6:00 AM, the expected number of calls begins to rise significantly. This coincides with the start of the day when people are more active, and potential incidents that require fire suppression may increase. 
+
+- *Peak in Late Afternoon (3:00 PM - 6:00 PM):* The expected number of calls reaches its peak between 3:00 PM and 6:00 PM. This might be due to higher levels of activity during these hours, possibly related to both work and home-related incidents. The confidence bands are slightly wider here, suggesting more variability in the data during these hours.
+
+- *Evening Decline (6:00 PM - 12:00 AM):* After the peak, the expected number of calls declines into the late evening. This makes sense as activities generally slow down, and fewer incidents requiring fire suppression occur.
+
+- It is important to note a huge caveat of the analysis. Because our data contains a lot of zeros (i.e. there are hours of days with no calls, and we padded our data set with zero when there was no call), the expected number of calls will be lower than 1. Thus, this tool does not tell us how many calls to expect and when, but rather only detects the peak times of day for calls.
+
+# Conclusion
+
+This analysis provides a picture of how the expected number of fire suppression calls varies throughout the day. Our analysis suggests that call counts do not vary a lot based on the year, month, day of week, or holiday status. We find that the late afternoon is the peak period for calls, while the early morning is relatively quiet. Our statistical model shows predictions and confidence intervals that offer insight into the certainty of the model's estimates, with more uncertainty during high-activity periods.
+
+These results may have practical implications to help with resource allocation, risk management, and operational planning during high v.s. low-demand periods.
